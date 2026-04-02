@@ -1,0 +1,339 @@
+--RESULTS TABLE
+CREATE OR REPLACE TABLE DB_NAME.SCHEMA_NAME.DQ_RESULTS (
+TABLE_NAME STRING,
+SCHEMA_NAME STRING,
+CHECK_TYPE STRING,
+STATUS STRING,
+DETAILS STRING,
+RUN_TIMESTAMP TIMESTAMP
+);
+
+SELECT * FROM DB_NAME.SCHEMA_NAME.DQ_RESULTS;
+
+
+
+--CONFIG_TABLE
+CREATE OR REPLACE TABLE DB_NAME.SCHEMA_NAME.DQ_TABLE_CONFIG (
+SRC_TABLE STRING,
+TGT_TABLE STRING,
+KEYS STRING,
+EXCLUDED_COLUMNS_SRC STRING,
+EXCLUDED_COLUMNS_TGT STRING
+);
+
+TRUNCATE TABLE DB_NAME.SCHEMA_NAME.DQ_TABLE_CONFIG;
+
+INSERT INTO DB_NAME.SCHEMA_NAME.DQ_TABLE_CONFIG
+VALUES
+(
+'DB_NAME.SCHEMA.NAME.SRC_TABLE_NAME',
+'DB_NAME.SCHEMA.NAME.TGT_TABLE_NAME',
+'["PK_COLUMN_1","PK_COLUMN_2"]',
+'["EXCLUDED_COLUMN_1","EXCLUDED_COLUMN_2"]',
+'["EXCLUDED_COLUMN_1","EXCLUDED_COLUMN_2"]'
+);
+
+
+SELECT * FROM DB_NAME.SCHEMA_NAME.DQ_TABLE_CONFIG;
+
+
+
+--BUSINESS RULES TABLE
+CREATE OR REPLACE TABLE DB_NAME.SCHEMA_NAME.DQ_BUSINESS_RULES
+(
+TABLE_NAME STRING,
+SCHEMA_NAME STRING,
+RULE_NAME STRING,
+RULE_SQL STRING,
+IS_ACTIVE STRING
+);
+
+
+INSERT INTO DB_NAME.SCHEMA_NAME.DQ_BUSINESS_RULES
+VALUES
+(
+'CUSTOMER_TARGET',
+'EMPLOYEES',
+'CITY_CHECK',
+'SELECT COUNT(*) FROM DB_NAME.SCHEMA.NAME.TGT_TABLE_NAME WHERE CITY NOT IN (''Patna'',''Delhi'')',
+'Y'
+);
+
+SELECT * FROM DB_NAME.SCHEMA_NAME.DQ_BUSINESS_RULES;
+
+
+
+
+CALL DB_NAME.SCHEMA_NAME.RUN_DQ_CHECKS();
+
+--STORED PROCEDURE FOR VALIDATION
+CREATE OR REPLACE PROCEDURE DB_NAME.SCHEMA_NAME.RUN_DQ_CHECKS()
+RETURNS STRING
+LANGUAGE JAVASCRIPT
+EXECUTE AS CALLER
+AS
+$$
+try {
+
+snowflake.createStatement({
+sqlText:`TRUNCATE TABLE DB_NAME.SCHEMA_NAME.DQ_RESULTS`
+}).execute();
+
+var rs = snowflake.createStatement({
+sqlText:`SELECT SRC_TABLE, TGT_TABLE, KEYS,
+EXCLUDED_COLUMNS_SRC, EXCLUDED_COLUMNS_TGT
+FROM DB_NAME.SCHEMA_NAME.DQ_TABLE_CONFIG`
+}).execute();
+
+var tables = [];
+
+while(rs.next()){
+tables.push({
+src_table: rs.getColumnValue(1),
+tgt_table: rs.getColumnValue(2),
+keys: JSON.parse(rs.getColumnValue(3)),
+
+// ✅ SAFE PARSING (NULL / EMPTY HANDLED)
+exclude_src: (rs.getColumnValue(4) && rs.getColumnValue(4).trim() !== '') 
+             ? JSON.parse(rs.getColumnValue(4)) : [],
+
+exclude_tgt: (rs.getColumnValue(5) && rs.getColumnValue(5).trim() !== '') 
+             ? JSON.parse(rs.getColumnValue(5)) : []
+});
+}
+
+
+// ✅ FUNCTION: GET FILTERED COLUMNS
+function getFilteredColumns(tableName, excludeCols){
+
+var schema = tableName.split('.')[1];
+var table = tableName.split('.')[2];
+
+var sql = `
+SELECT COLUMN_NAME
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA='${schema}'
+AND TABLE_NAME='${table}'
+`;
+
+var rs_cols = snowflake.createStatement({sqlText:sql}).execute();
+
+var cols = [];
+
+var excludeUpper = excludeCols.map(c => c.toUpperCase());
+
+while(rs_cols.next()){
+var col = rs_cols.getColumnValue(1);
+
+if(!excludeUpper.includes(col.toUpperCase())){
+cols.push(col);
+}
+}
+
+return cols;
+}
+
+
+for(var i=0;i<tables.length;i++){
+
+var t = tables[i];
+
+var srcTable = t.src_table;
+var tgtTable = t.tgt_table;
+var keys = t.keys;
+
+var tableName = tgtTable.split('.')[2];
+var schemaName = tgtTable.split('.')[1];
+
+var keyExpr = keys.join(', ');
+
+
+// ================= COUNT CHECK =================
+var sql_count = `
+SELECT
+(SELECT COUNT(*) FROM ${srcTable}),
+(SELECT COUNT(*) FROM ${tgtTable})
+`;
+
+var rs_count = snowflake.createStatement({sqlText:sql_count}).execute();
+rs_count.next();
+
+var src_count = rs_count.getColumnValue(1);
+var tgt_count = rs_count.getColumnValue(2);
+
+var status = (src_count == tgt_count) ? 'PASS' : 'FAIL';
+
+snowflake.createStatement({
+sqlText:`INSERT INTO DB_NAME.SCHEMA_NAME.DQ_RESULTS
+VALUES(?,?,'COUNT_CHECK',?, ?,CURRENT_TIMESTAMP)`,
+binds:[tableName,schemaName,status,`SRC=${src_count},TGT=${tgt_count}`]
+}).execute();
+
+
+// ================= DUPLICATE CHECK =================
+var sql_dup_src = `
+SELECT COUNT(*) FROM (
+SELECT ${keyExpr},COUNT(*)
+FROM ${srcTable}
+GROUP BY ${keyExpr}
+HAVING COUNT(*)>1
+)
+`;
+
+var sql_dup_tgt = `
+SELECT COUNT(*) FROM (
+SELECT ${keyExpr},COUNT(*)
+FROM ${tgtTable}
+GROUP BY ${keyExpr}
+HAVING COUNT(*)>1
+)
+`;
+
+var rs_dup_src = snowflake.createStatement({sqlText:sql_dup_src}).execute(); 
+rs_dup_src.next();
+
+var rs_dup_tgt = snowflake.createStatement({sqlText:sql_dup_tgt}).execute(); 
+rs_dup_tgt.next();
+
+var d1 = rs_dup_src.getColumnValue(1);
+var d2 = rs_dup_tgt.getColumnValue(1);
+
+var status = (d1==0 && d2==0) ? 'PASS':'FAIL';
+
+snowflake.createStatement({
+sqlText:`INSERT INTO DB_NAME.SCHEMA_NAME.DQ_RESULTS
+VALUES(?,?,'DUPLICATE_CHECK',?, ?,CURRENT_TIMESTAMP)`,
+binds:[tableName,schemaName,status,`SRC_DUP=${d1},TGT_DUP=${d2}`]
+}).execute();
+
+
+// ================= NULL CHECK =================
+var null_conditions = keys.map(k=>`${k} IS NULL`).join(' OR ');
+
+var sql_null_src = `SELECT COUNT(*) FROM ${srcTable} WHERE ${null_conditions}`;
+var sql_null_tgt = `SELECT COUNT(*) FROM ${tgtTable} WHERE ${null_conditions}`;
+
+var rs_null_src = snowflake.createStatement({sqlText:sql_null_src}).execute(); 
+rs_null_src.next();
+
+var rs_null_tgt = snowflake.createStatement({sqlText:sql_null_tgt}).execute(); 
+rs_null_tgt.next();
+
+var n1 = rs_null_src.getColumnValue(1);
+var n2 = rs_null_tgt.getColumnValue(1);
+
+var status = (n1==0 && n2==0) ? 'PASS':'FAIL';
+
+snowflake.createStatement({
+sqlText:`INSERT INTO DB_NAME.SCHEMA_NAME.DQ_RESULTS
+VALUES(?,?,'NULL_CHECK',?, ?,CURRENT_TIMESTAMP)`,
+binds:[tableName,schemaName,status,`SRC_NULL=${n1},TGT_NULL=${n2}`]
+}).execute();
+
+
+// ================= STRUCTURE + DATA =================
+
+var srcCols = getFilteredColumns(srcTable, t.exclude_src);
+var tgtCols = getFilteredColumns(tgtTable, t.exclude_tgt);
+
+// SAFETY CHECK
+if(srcCols.length == 0 || tgtCols.length == 0){
+throw "No columns available after exclusion for " + tableName;
+}
+
+// STRUCTURE CHECK
+var struct_ok = (srcCols.sort().join() == tgtCols.sort().join());
+
+var status = struct_ok ? 'PASS':'FAIL';
+
+snowflake.createStatement({
+sqlText:`INSERT INTO DB_NAME.SCHEMA_NAME.DQ_RESULTS
+VALUES(?,?,'STRUCTURE_CHECK',?, ?,CURRENT_TIMESTAMP)`,
+binds:[tableName,schemaName,status,
+`SRC_COLS=${srcCols.length},TGT_COLS=${tgtCols.length}`]
+}).execute();
+
+
+// ================= DATA COMPARISON =================
+var srcColList = srcCols.join(', ');
+var tgtColList = tgtCols.join(', ');
+
+var sql_diff = `
+SELECT COUNT(*) FROM (
+(SELECT ${srcColList} FROM ${srcTable}
+MINUS
+SELECT ${tgtColList} FROM ${tgtTable})
+UNION
+(SELECT ${tgtColList} FROM ${tgtTable}
+MINUS
+SELECT ${srcColList} FROM ${srcTable})
+)
+`;
+
+var rs_diff = snowflake.createStatement({sqlText:sql_diff}).execute();
+rs_diff.next();
+
+var diff_cnt = rs_diff.getColumnValue(1);
+
+var status = (diff_cnt==0)?'PASS':'FAIL';
+
+snowflake.createStatement({
+sqlText:`INSERT INTO DB_NAME.SCHEMA_NAME.DQ_RESULTS
+VALUES(?,?,'DATA_COMPARISON',?, ?,CURRENT_TIMESTAMP)`,
+binds:[tableName,schemaName,status,`DIFF_COUNT=${diff_cnt}`]
+}).execute();
+
+
+// ================= BUSINESS RULE =================
+var sql_rules = `
+SELECT RULE_NAME,RULE_SQL
+FROM DB_NAME.SCHEMA_NAME.DQ_BUSINESS_RULES
+WHERE TABLE_NAME='${tableName}'
+AND SCHEMA_NAME='${schemaName}'
+AND IS_ACTIVE='Y'
+`;
+
+var rs_rules = snowflake.createStatement({sqlText:sql_rules}).execute();
+
+while(rs_rules.next()){
+
+var ruleName = rs_rules.getColumnValue(1);
+var ruleSql = rs_rules.getColumnValue(2);
+
+var rs_rule = snowflake.createStatement({sqlText:ruleSql}).execute();
+rs_rule.next();
+
+var bad_count = rs_rule.getColumnValue(1);
+
+var status = (bad_count==0)?'PASS':'FAIL';
+
+snowflake.createStatement({
+sqlText:`INSERT INTO DB_NAME.SCHEMA_NAME.DQ_RESULTS
+VALUES(?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+binds:[
+tableName,
+schemaName,
+'BUSINESS_RULE_'+ruleName,
+status,
+'FAILED_RECORDS='+bad_count
+]
+}).execute();
+
+}
+
+}
+
+return 'DQ CHECKS COMPLETED';
+
+}
+catch(err){
+return 'FAILED: '+err;
+}
+$$;
+
+
+CALL DB_NAME.SCHEMA_NAME.RUN_DQ_CHECKS();
+
+SELECT * FROM DB_NAME.SCHEMA_NAME.DQ_TABLE_CONFIG;
+SELECT * FROM DB_NAME.SCHEMA_NAME.DQ_BUSINESS_RULES;
+SELECT * FROM DB_NAME.SCHEMA_NAME.DQ_RESULTS;
