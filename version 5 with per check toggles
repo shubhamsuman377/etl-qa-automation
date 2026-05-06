@@ -1,0 +1,274 @@
+-- =============================================
+-- RESULTS TABLE (unchanged)
+-- =============================================
+CREATE OR REPLACE TABLE DB_NAME.SCHEMA_NAME.DQ_RESULTS (
+    TABLE_NAME          STRING,
+    CHECK_TYPE          STRING,
+    STATUS              STRING,
+    DETAILS             STRING,
+    RUN_TIMESTAMP       TIMESTAMP
+);
+
+-- =============================================
+-- CONFIG TABLE (enhanced with per-check toggles)
+-- =============================================
+CREATE OR REPLACE TABLE DB_NAME.SCHEMA_NAME.DQ_TABLE_CONFIG (
+    SRC_TABLE               STRING,
+    TGT_TABLE               STRING,
+    KEYS                    STRING,
+    EXCLUDED_COLUMNS_SRC    STRING,
+    EXCLUDED_COLUMNS_TGT    STRING,
+    -- Per-check toggle flags (Y = active, N = skip)
+    IS_COUNT_CHECK          STRING  DEFAULT 'Y',
+    IS_DUPLICATE_CHECK      STRING  DEFAULT 'Y',
+    IS_NULL_CHECK           STRING  DEFAULT 'Y',
+    IS_STRUCTURE_CHECK      STRING  DEFAULT 'Y',
+    IS_DATA_COMPARISON      STRING  DEFAULT 'Y',
+    IS_BUSINESS_RULE_CHECK  STRING  DEFAULT 'Y'
+);
+
+TRUNCATE TABLE DB_NAME.SCHEMA_NAME.DQ_TABLE_CONFIG;
+
+INSERT INTO DB_NAME.SCHEMA_NAME.DQ_TABLE_CONFIG
+VALUES (
+    'DB_NAME.SCHEMA.NAME.SRC_TABLE_NAME',
+    'DB_NAME.SCHEMA.NAME.TGT_TABLE_NAME',
+    '["PK_COLUMN_1","PK_COLUMN_2"]',
+    '["EXCLUDED_COLUMN_1","EXCLUDED_COLUMN_2"]',
+    '["EXCLUDED_COLUMN_1","EXCLUDED_COLUMN_2"]',
+    'Y',  -- IS_COUNT_CHECK
+    'Y',  -- IS_DUPLICATE_CHECK
+    'Y',  -- IS_NULL_CHECK
+    'Y',  -- IS_STRUCTURE_CHECK
+    'N',  -- IS_DATA_COMPARISON  (disabled for this table)
+    'Y'   -- IS_BUSINESS_RULE_CHECK
+);
+
+SELECT * FROM DB_NAME.SCHEMA_NAME.DQ_TABLE_CONFIG;
+
+-- =============================================
+-- BUSINESS RULES TABLE (unchanged)
+-- =============================================
+CREATE OR REPLACE TABLE DB_NAME.SCHEMA_NAME.DQ_BUSINESS_RULES (
+    TABLE_NAME  STRING,
+    SCHEMA_NAME STRING,
+    RULE_NAME   STRING,
+    RULE_SQL    STRING,
+    IS_ACTIVE   STRING
+);
+
+INSERT INTO DB_NAME.SCHEMA_NAME.DQ_BUSINESS_RULES VALUES (
+    'EDB_SIT_ICM_01.SCH_FT_PRST.GDP_HOLDINGS',
+    'SCH_FT_PRST',
+    'NULL_ISIN_CHECK_IN_EDB_PRST',
+    'SELECT COUNT(*) FROM EDB_SIT_ICM_01.SCH_FT_PRST.GDP_HOLDINGS WHERE ISIN IS NULL',
+    'Y'
+);
+
+-- =============================================
+-- STORED PROCEDURE (enhanced with toggle checks)
+-- =============================================
+CREATE OR REPLACE PROCEDURE DB_NAME.SCHEMA_NAME.RUN_DQ_CHECKS()
+RETURNS STRING
+LANGUAGE JAVASCRIPT
+EXECUTE AS CALLER
+AS
+$$
+try {
+
+    snowflake.createStatement({
+        sqlText: `TRUNCATE TABLE DB_NAME.SCHEMA_NAME.DQ_RESULTS`
+    }).execute();
+
+    // ================= COMMON FUNCTIONS =================
+
+    function insertResult(tableName, checkType, status, details) {
+        snowflake.createStatement({
+            sqlText: `INSERT INTO DB_NAME.SCHEMA_NAME.DQ_RESULTS
+                      VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+            binds: [tableName, checkType, status, details]
+        }).execute();
+    }
+
+    function getCount(sql) {
+        var rs = snowflake.createStatement({ sqlText: sql }).execute();
+        rs.next();
+        return rs.getColumnValue(1);
+    }
+
+    function getCols(tableName, excludeCols) {
+        var rs = snowflake.createStatement({
+            sqlText: `SHOW COLUMNS IN ${tableName}`
+        }).execute();
+
+        var cols = [];
+        var exclude = excludeCols.map(c => c.toUpperCase());
+
+        while (rs.next()) {
+            var col = rs.getColumnValue("column_name");
+            if (!exclude.includes(col.toUpperCase())) {
+                cols.push(col);
+            }
+        }
+
+        if (cols.length === 0) {
+            throw "No usable columns for " + tableName;
+        }
+        return cols;
+    }
+
+    // Helper: safely parse JSON, return empty array on null/empty
+    function parseJson(val) {
+        return (val && val.trim() !== '') ? JSON.parse(val) : [];
+    }
+
+    // ================= LOAD CONFIG =================
+    var rs = snowflake.createStatement({
+        sqlText: `SELECT
+                    SRC_TABLE,
+                    TGT_TABLE,
+                    KEYS,
+                    EXCLUDED_COLUMNS_SRC,
+                    EXCLUDED_COLUMNS_TGT,
+                    IS_COUNT_CHECK,
+                    IS_DUPLICATE_CHECK,
+                    IS_NULL_CHECK,
+                    IS_STRUCTURE_CHECK,
+                    IS_DATA_COMPARISON,
+                    IS_BUSINESS_RULE_CHECK
+                  FROM DB_NAME.SCHEMA_NAME.DQ_TABLE_CONFIG`
+    }).execute();
+
+    while (rs.next()) {
+
+        var src   = rs.getColumnValue(1);
+        var tgt   = rs.getColumnValue(2);
+        var keys  = parseJson(rs.getColumnValue(3));
+        var exSrc = parseJson(rs.getColumnValue(4));
+        var exTgt = parseJson(rs.getColumnValue(5));
+
+        // Read toggle flags
+        var doCount         = rs.getColumnValue(6)  === 'Y';
+        var doDuplicate     = rs.getColumnValue(7)  === 'Y';
+        var doNull          = rs.getColumnValue(8)  === 'Y';
+        var doStructure     = rs.getColumnValue(9)  === 'Y';
+        var doDataCompare   = rs.getColumnValue(10) === 'Y';
+        var doBusinessRules = rs.getColumnValue(11) === 'Y';
+
+        var tableName = tgt;
+        var keyExpr   = keys.join(', ');
+
+
+        // ================= COUNT CHECK =================
+        if (doCount) {
+            var srcCnt = getCount(`SELECT COUNT(*) FROM ${src}`);
+            var tgtCnt = getCount(`SELECT COUNT(*) FROM ${tgt}`);
+
+            insertResult(tableName, 'COUNT_CHECK',
+                (srcCnt == tgtCnt ? 'PASS' : 'FAIL'),
+                `SRC=${srcCnt},TGT=${tgtCnt}`);
+        }
+
+
+        // ================= DUPLICATE CHECK =================
+        if (doDuplicate) {
+            var dupSrc = getCount(`
+                SELECT COUNT(*) FROM (
+                    SELECT ${keyExpr}, COUNT(*)
+                    FROM ${src}
+                    GROUP BY ${keyExpr}
+                    HAVING COUNT(*) > 1
+                )`);
+
+            var dupTgt = getCount(`
+                SELECT COUNT(*) FROM (
+                    SELECT ${keyExpr}, COUNT(*)
+                    FROM ${tgt}
+                    GROUP BY ${keyExpr}
+                    HAVING COUNT(*) > 1
+                )`);
+
+            insertResult(tableName, 'DUPLICATE_CHECK',
+                (dupSrc == 0 && dupTgt == 0 ? 'PASS' : 'FAIL'),
+                `SRC_DUP=${dupSrc},TGT_DUP=${dupTgt}`);
+        }
+
+
+        // ================= NULL CHECK =================
+        if (doNull) {
+            var cond    = keys.map(k => `${k} IS NULL`).join(' OR ');
+            var nullSrc = getCount(`SELECT COUNT(*) FROM ${src} WHERE ${cond}`);
+            var nullTgt = getCount(`SELECT COUNT(*) FROM ${tgt} WHERE ${cond}`);
+
+            insertResult(tableName, 'NULL_CHECK',
+                (nullSrc == 0 && nullTgt == 0 ? 'PASS' : 'FAIL'),
+                `SRC_NULL=${nullSrc},TGT_NULL=${nullTgt}`);
+        }
+
+
+        // ================= STRUCTURE CHECK =================
+        if (doStructure) {
+            var srcCols  = getCols(src, exSrc);
+            var tgtCols  = getCols(tgt, exTgt);
+            var structOk = (srcCols.sort().join() === tgtCols.sort().join());
+
+            insertResult(tableName, 'STRUCTURE_CHECK',
+                (structOk ? 'PASS' : 'FAIL'),
+                `SRC_COLS=${srcCols.length},TGT_COLS=${tgtCols.length}`);
+        }
+
+
+        // ================= DATA COMPARISON =================
+        if (doDataCompare) {
+            // Reuse cols if structure check already ran, otherwise fetch
+            var sCols = doStructure ? srcCols : getCols(src, exSrc);
+            var tCols = doStructure ? tgtCols : getCols(tgt, exTgt);
+
+            var diff = getCount(`
+                SELECT COUNT(*) FROM (
+                    (SELECT ${sCols.join(',')} FROM ${src}
+                     MINUS
+                     SELECT ${tCols.join(',')} FROM ${tgt})
+                    UNION
+                    (SELECT ${tCols.join(',')} FROM ${tgt}
+                     MINUS
+                     SELECT ${sCols.join(',')} FROM ${src})
+                )`);
+
+            insertResult(tableName, 'DATA_COMPARISON',
+                (diff == 0 ? 'PASS' : 'FAIL'),
+                `DIFF=${diff}`);
+        }
+
+
+        // ================= BUSINESS RULE CHECKS =================
+        if (doBusinessRules) {
+            var rules = snowflake.createStatement({
+                sqlText: `SELECT RULE_NAME, RULE_SQL
+                          FROM DB_NAME.SCHEMA_NAME.DQ_BUSINESS_RULES
+                          WHERE TABLE_NAME = '${tableName}'
+                          AND IS_ACTIVE = 'Y'`
+            }).execute();
+
+            while (rules.next()) {
+                var name = rules.getColumnValue(1);
+                var sql  = rules.getColumnValue(2);
+                var bad  = getCount(sql);
+
+                insertResult(
+                    tableName,
+                    'BUSINESS_RULE_' + name,
+                    (bad == 0 ? 'PASS' : 'FAIL'),
+                    (bad == 0 ? 'No issues found' : 'Failed count = ' + bad)
+                );
+            }
+        }
+
+    } // end while config loop
+
+    return 'DQ CHECKS COMPLETED';
+
+} catch (err) {
+    return 'FAILED: ' + err;
+}
+$$;
